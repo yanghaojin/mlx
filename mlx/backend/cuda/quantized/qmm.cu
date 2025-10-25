@@ -34,8 +34,8 @@ __device__ inline void load_quantized(
   const int Ng = N / group_size;
 
   // 修复：基于tile的K偏移和当前row计算group
-  const int k_position = tile_k_offset + row;
-  const int group_id = k_position / group_size;
+  int k_position = tile_k_offset + row;
+  int group_id = k_position / group_size;
 
   // 计算N维度的起始位置（每个load处理ELEMENTS_PER_LOAD个元素）
   const int n_start = col * ELEMENTS_PER_LOAD;
