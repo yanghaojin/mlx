@@ -138,6 +138,6 @@ FetchContent_Declare(
   kittens
   GIT_REPOSITORY https://github.com/HazyResearch/ThunderKittens.git
   GIT_TAG aaab847f430ed313ed466e64b25b9177babd1db8
-  GIT_SHALLOW TRUE)
+  GIT_SHALLOW FALSE)
 FetchContent_MakeAvailable(kittens)
 target_include_directories(mlx BEFORE PRIVATE "${kittens_SOURCE_DIR}/include")

@@ -17,7 +17,8 @@ __device__ inline void load_quantized(
     const uint8_t* x,
     const T* scales,
     const T* biases,
-    int N) {
+    int N,
+    int tile_k_offset) {
   constexpr int NUM_THREADS = NUM_WARPS * 32;
   constexpr int ELEMENTS_PER_LOAD = sizeof(uint32_t) * get_pack_factor<bits>();
   constexpr int NUM_LOADS = Tile::NUMEL / ELEMENTS_PER_LOAD;
@@ -32,20 +33,47 @@ __device__ inline void load_quantized(
   const int Nx = N / get_pack_factor<bits>();
   const int Ng = N / group_size;
 
+  // 修复：基于tile的K偏移和当前row计算group
+  const int k_position = tile_k_offset + row;
+  const int group_id = k_position / group_size;
+
+  // 计算N维度的起始位置（每个load处理ELEMENTS_PER_LOAD个元素）
+  const int n_start = col * ELEMENTS_PER_LOAD;
+
+  // scale/bias在N维度上的索引（每个group对应N/group_size个scale）
+  const int n_group_idx = n_start / group_size;
+
+  // 初始化scale和bias（从当前group和N位置读取）
+  T s = scales[group_id * Ng + n_group_idx];
+  T b = biases[group_id * Ng + n_group_idx];
+
+  // 量化权重的指针
   x += row * Nx + col * (ELEMENTS_PER_LOAD / get_pack_factor<bits>());
-  scales += row * Ng + col * ELEMENTS_PER_LOAD / group_size;
-  biases += row * Ng + col * ELEMENTS_PER_LOAD / group_size;
 
   MLX_UNROLL
   for (int i = 0; i < NUM_LOADS_PER_THREAD; i++) {
-    T vs[ELEMENTS_PER_LOAD];
+    // 检查是否跨越了group边界
+    const int current_k = k_position + i * STEP_ROWS;
+    const int current_group = current_k / group_size;
+
+    // 如果跨越group边界，更新scale和bias
+    if (current_group != group_id) {
+      group_id = current_group;
+      s = scales[current_group * Ng + n_group_idx];
+      b = biases[current_group * Ng + n_group_idx];
+    }
+
+    // 读取量化数据
     uint32_t w = *reinterpret_cast<const uint32_t*>(x + i * STEP_ROWS * Nx);
-    T s = scales[i * STEP_ROWS * Ng];
-    T b = biases[i * STEP_ROWS * Ng];
+
+    // Dequantize
+    T vs[ELEMENTS_PER_LOAD];
     MLX_UNROLL
     for (int j = 0; j < ELEMENTS_PER_LOAD; j++) {
       vs[j] = static_cast<T>((w >> (j * bits)) & MASK) * s + b;
     }
+
+    // 存储到tile
     tile.store(vs, row + i * STEP_ROWS, col * ELEMENTS_PER_LOAD);
   }
 }
@@ -113,7 +141,8 @@ __global__ void qmm_t(
           w + k_block / get_pack_factor<bits>(),
           scales + k_block / group_size,
           biases + k_block / group_size,
-          K);
+          K,
+          k_block);
       cp_async_wait_all();
       __syncthreads();
 
@@ -143,7 +172,8 @@ __global__ void qmm_t(
           w + k_block / get_pack_factor<bits>(),
           scales + k_block / group_size,
           biases + k_block / group_size,
-          K);
+          K,
+          k_block);
       cp_async_wait_all();
       __syncthreads();
 
