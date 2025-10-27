@@ -1,4 +1,5 @@
 // Copyright © 2025 Apple Inc.
+// Modified for GPTQ-style quantization (grouping along K dimension)
 
 #include "mlx/backend/cuda/device.h"
 #include "mlx/backend/cuda/kernel_utils.cuh"
@@ -11,6 +12,8 @@ namespace mlx::core {
 
 namespace cu {
 
+// GPTQ-style quantization: groups along K dimension, not N
+// Formula: dequant_val = q * scale + bias (where bias = -zero from GPTQ)
 template <int NUM_WARPS, int group_size, int bits, typename T, typename Tile>
 __device__ inline void load_quantized(
     Tile& tile,
@@ -18,7 +21,7 @@ __device__ inline void load_quantized(
     const T* scales,
     const T* biases,
     int N,
-    int tile_k_offset) {
+    int valid_rows) {  // Number of valid output channels
   constexpr int NUM_THREADS = NUM_WARPS * 32;
   constexpr int ELEMENTS_PER_LOAD = sizeof(uint32_t) * get_pack_factor<bits>();
   constexpr int NUM_LOADS = Tile::NUMEL / ELEMENTS_PER_LOAD;
@@ -33,48 +36,39 @@ __device__ inline void load_quantized(
   const int Nx = N / get_pack_factor<bits>();
   const int Ng = N / group_size;
 
-  // 修复：基于tile的K偏移和当前row计算group
-  int k_position = tile_k_offset + row;
-  int group_id = k_position / group_size;
-
-  // 计算N维度的起始位置（每个load处理ELEMENTS_PER_LOAD个元素）
-  const int n_start = col * ELEMENTS_PER_LOAD;
-
-  // scale/bias在N维度上的索引（每个group对应N/group_size个scale）
-  const int n_group_idx = n_start / group_size;
-
-  // 初始化scale和bias（从当前group和N位置读取）
-  T s = scales[group_id * Ng + n_group_idx];
-  T b = biases[group_id * Ng + n_group_idx];
-
-  // 量化权重的指针
   x += row * Nx + col * (ELEMENTS_PER_LOAD / get_pack_factor<bits>());
+
+  // Only add offset if within valid range, otherwise point to first row (will be ignored)
+  const T* scales_ptr = (row < valid_rows) ?
+      (scales + row * Ng + col * ELEMENTS_PER_LOAD / group_size) : scales;
+  const T* biases_ptr = (row < valid_rows) ?
+      (biases + row * Ng + col * ELEMENTS_PER_LOAD / group_size) : biases;
 
   MLX_UNROLL
   for (int i = 0; i < NUM_LOADS_PER_THREAD; i++) {
-    // 检查是否跨越了group边界
-    const int current_k = k_position + i * STEP_ROWS;
-    const int current_group = current_k / group_size;
-
-    // 如果跨越group边界，更新scale和bias
-    if (current_group != group_id) {
-      group_id = current_group;
-      s = scales[current_group * Ng + n_group_idx];
-      b = biases[current_group * Ng + n_group_idx];
-    }
-
-    // 读取量化数据
-    uint32_t w = *reinterpret_cast<const uint32_t*>(x + i * STEP_ROWS * Nx);
-
-    // Dequantize
+    int current_row = row + i * STEP_ROWS;
     T vs[ELEMENTS_PER_LOAD];
-    MLX_UNROLL
-    for (int j = 0; j < ELEMENTS_PER_LOAD; j++) {
-      vs[j] = static_cast<T>((w >> (j * bits)) & MASK) * s + b;
+
+    if (current_row < valid_rows) {
+      // Process valid rows normally
+      uint32_t w = *reinterpret_cast<const uint32_t*>(x + i * STEP_ROWS * Nx);
+      T s = scales_ptr[i * STEP_ROWS * Ng];
+      T b = biases_ptr[i * STEP_ROWS * Ng];
+
+      MLX_UNROLL
+      for (int j = 0; j < ELEMENTS_PER_LOAD; j++) {
+        T q_val = static_cast<T>((w >> (j * bits)) & MASK);
+        vs[j] = q_val * s + b;
+      }
+    } else {
+      // Fill invalid rows with zeros
+      MLX_UNROLL
+      for (int j = 0; j < ELEMENTS_PER_LOAD; j++) {
+        vs[j] = static_cast<T>(0);
+      }
     }
 
-    // 存储到tile
-    tile.store(vs, row + i * STEP_ROWS, col * ELEMENTS_PER_LOAD);
+    tile.store(vs, current_row, col * ELEMENTS_PER_LOAD);
   }
 }
 
@@ -118,6 +112,7 @@ __global__ void qmm_t(
   RegisterTile<T, BN / WARPS_N, 16> B;
 
   const int max_rows = M - blockIdx.y * BM;
+  const int valid_weight_rows = min(BN, N - blockIdx.x * BN);  // Valid output channels in this block
 
   x += blockIdx.y * BM * K;
   w += blockIdx.x * BN * K / get_pack_factor<bits>();
@@ -142,7 +137,7 @@ __global__ void qmm_t(
           scales + k_block / group_size,
           biases + k_block / group_size,
           K,
-          k_block);
+          valid_weight_rows);
       cp_async_wait_all();
       __syncthreads();
 
@@ -161,7 +156,11 @@ __global__ void qmm_t(
         mma_t(C, A, B);
       }
     }
-    C.store_global(y, N, offset_m, offset_n);
+
+    // Store output
+    if (offset_n < N) {
+      C.store_global(y, N, offset_m, offset_n);
+    }
   } else {
     for (int k_block = 0; k_block < K; k_block += BK) {
       load_async_safe<NUM_WARPS>(
@@ -173,7 +172,7 @@ __global__ void qmm_t(
           scales + k_block / group_size,
           biases + k_block / group_size,
           K,
-          k_block);
+          valid_weight_rows);
       cp_async_wait_all();
       __syncthreads();
 
@@ -192,7 +191,11 @@ __global__ void qmm_t(
         mma_t(C, A, B);
       }
     }
-    C.store_global_safe(y, N, offset_m, offset_n, max_rows);
+
+    // Store output with boundary checking
+    if (offset_n < N) {
+      C.store_global_safe(y, N, offset_m, offset_n, max_rows);
+    }
   }
 }
 
@@ -212,13 +215,21 @@ void qmm(
     int K,
     cu::CommandEncoder& enc,
     const Stream& s) {
-  if (x.dtype() != bfloat16) {
-    throw std::invalid_argument("[qmm] Only bfloat16 is supported for now");
+
+  if (x.dtype() != bfloat16 && x.dtype() != float16) {
+    throw std::invalid_argument("[qmm] Only bfloat16 and float16 are supported");
   }
   if (!transpose_) {
     throw std::invalid_argument(
         "[qmm] Only transposed matmul is supported for now");
   }
+
+  // Register input and output arrays with the command encoder
+  enc.set_input_array(x);
+  enc.set_input_array(w);
+  enc.set_input_array(scales);
+  enc.set_input_array(biases);
+  enc.set_output_array(out);
 
   dispatch_float_types(x.dtype(), "qmm", [&](auto type_tag) {
     dispatch_groups(group_size_, [&](auto group_size) {
@@ -228,11 +239,15 @@ void qmm(
         constexpr int BM = 128;
         constexpr int BN = 128;
         constexpr int BK = 32;
-        auto kernel =
-            cu::qmm_t<DataType, BM, BN, BK, group_size.value, bits.value, true>;
+
+        auto kernel = cu::qmm_t<
+            DataType, BM, BN, BK,
+            group_size.value, bits.value, true>;
+
         if (M % BM != 0) {
-          kernel = cu::
-              qmm_t<DataType, BM, BN, BK, group_size.value, bits.value, false>;
+          kernel = cu::qmm_t<
+              DataType, BM, BN, BK,
+              group_size.value, bits.value, false>;
         }
 
         dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
