@@ -110,4 +110,40 @@ void fast::AffineQuantize::eval_gpu(
   }
 }
 
+void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
+  auto& s = stream();
+  auto& d = cu::device(s.device);
+  auto& enc = d.get_command_encoder(s);
+
+  out.set_data(allocator::malloc(out.nbytes()));
+
+  array x = ensure_row_contiguous_matrix(inputs[0], enc, s);
+  array w = ensure_row_contiguous_matrix(inputs[1], enc, s);
+  array scales = ensure_row_contiguous_matrix(inputs[2], enc, s);
+  array biases = ensure_row_contiguous_matrix(inputs[3], enc, s);
+  const array& lhs_indices = inputs[4];
+  array rhs_indices = ensure_row_contiguous(inputs[5], enc, s);
+
+  int K = x.shape(-1);
+  int M = x.shape(-2);
+  int N = out.shape(-1);
+
+  gather_qmm(
+      x,
+      w,
+      scales,
+      biases,
+      lhs_indices,
+      rhs_indices,
+      out,
+      transpose_,
+      group_size_,
+      bits_,
+      M,
+      N,
+      K,
+      enc,
+      s);
+}
+
 } // namespace mlx::core

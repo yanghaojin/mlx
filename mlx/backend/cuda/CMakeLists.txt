@@ -45,6 +45,7 @@ target_sources(
           ${CMAKE_CURRENT_SOURCE_DIR}/quantized/affine_quantize.cu
           ${CMAKE_CURRENT_SOURCE_DIR}/quantized/qmm.cu
           ${CMAKE_CURRENT_SOURCE_DIR}/quantized/quantized.cu
+          ${CMAKE_CURRENT_SOURCE_DIR}/quantized/gather_qmm.cu
           ${CMAKE_CURRENT_SOURCE_DIR}/worker.cpp)
 
 target_compile_definitions(mlx PRIVATE MLX_USE_CUDA)
