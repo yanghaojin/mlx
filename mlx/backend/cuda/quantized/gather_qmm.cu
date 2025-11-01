@@ -3,8 +3,8 @@
 
 #include "mlx/backend/cuda/device.h"
 #include "mlx/backend/cuda/kernel_utils.cuh"
-#include "mlx/backend/cuda/matmul/mma.cuh"
-#include "mlx/backend/cuda/matmul/tiles.cuh"
+#include "mlx/backend/cuda/steel/mma.cuh"
+#include "mlx/backend/cuda/steel/tiles.cuh"
 #include "mlx/backend/cuda/quantized/quantized_utils.cuh"
 #include "mlx/dtype_utils.h"
 
