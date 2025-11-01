@@ -176,6 +176,7 @@ __global__ void gather_qmm_t_simple(
 
     if (offset_n < N) {
       C.store_global(y_ptr, N, offset_m, offset_n);
+      __threadfence();
     }
   } else {
     for (int k_block = 0; k_block < K; k_block += BK) {
@@ -210,6 +211,7 @@ __global__ void gather_qmm_t_simple(
 
     if (offset_n < N) {
 		C.store_global_safe(y_ptr, N, offset_m, offset_n, max_rows);
+		__threadfence();
     }
   }
 }
