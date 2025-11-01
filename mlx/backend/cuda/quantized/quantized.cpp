@@ -84,4 +84,76 @@ void fast::Quantize::eval_gpu(
   }
 }
 
+void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
+  nvtx3::scoped_range r("QuantizedMatmul::eval_gpu");
+  auto& s = stream();
+  auto& d = cu::device(s.device);
+  auto& enc = d.get_command_encoder(s);
+
+  out.set_data(allocator::malloc(out.nbytes()));
+
+  // Make sure the last two dims of x and w, s, b are contiguous
+  array x = ensure_row_contiguous_matrix(inputs[0], enc, s);
+  array w = ensure_row_contiguous_matrix(inputs[1], enc, s);
+  array scales = ensure_row_contiguous_matrix(inputs[2], enc, s);
+  array biases = ensure_row_contiguous_matrix(inputs[3], enc, s);
+
+  // Extract the matmul shapes
+  bool non_batched = w.ndim() == 2 && x.flags().row_contiguous;
+  int K = x.shape(-1);
+  int M = non_batched ? x.size() / K : x.shape(-2);
+  int N = out.shape(-1);
+
+  qmm(x,
+    w,
+    scales,
+    biases,
+    out,
+    transpose_,
+    group_size_,
+    bits_,
+    M,
+    N,
+    K,
+    enc,
+    s);
+}
+
+void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
+  nvtx3::scoped_range r("GatherQMM::eval_gpu");
+  auto& s = stream();
+  auto& d = cu::device(s.device);
+  auto& enc = d.get_command_encoder(s);
+
+  out.set_data(allocator::malloc(out.nbytes()));
+
+  array x = ensure_row_contiguous_matrix(inputs[0], enc, s);
+  array w = ensure_row_contiguous_matrix(inputs[1], enc, s);
+  array scales = ensure_row_contiguous_matrix(inputs[2], enc, s);
+  array biases = ensure_row_contiguous_matrix(inputs[3], enc, s);
+  const array& lhs_indices = inputs[4];
+  array rhs_indices = ensure_row_contiguous(inputs[5], enc, s);
+
+  int K = x.shape(-1);
+  int M = x.shape(-2);
+  int N = out.shape(-1);
+
+  gather_qmm(
+      x,
+      w,
+      scales,
+      biases,
+      lhs_indices,
+      rhs_indices,
+      out,
+      transpose_,
+      group_size_,
+      bits_,
+      M,
+      N,
+      K,
+      enc,
+      s);
+}
+
 } // namespace mlx::core

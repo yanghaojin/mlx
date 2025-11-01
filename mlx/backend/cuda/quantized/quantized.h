@@ -42,4 +42,36 @@ void fp_dequantize(
     cu::CommandEncoder& enc,
     const Stream& s);
 
+void qmm(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const array& biases,
+    array& out,
+    bool transpose_,
+    int group_size_,
+    int bits_,
+    int M,
+    int N,
+    int K,
+    cu::CommandEncoder& enc,
+    const Stream& s);
+
+void gather_qmm(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const array& biases,
+    const array& lhs_indices,
+    const array& rhs_indices,
+    array& out,
+    bool transpose,
+    int group_size,
+    int bits,
+    int M,
+    int N,
+    int K,
+    cu::CommandEncoder& enc,
+    const Stream& s);
+
 } // namespace mlx::core
