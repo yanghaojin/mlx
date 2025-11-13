@@ -1,5 +1,6 @@
-// Copyright © 2025 Apple Inc.
+// Author: GreenBitAI
 // Modified for GPTQ-style quantization (grouping along K dimension)
+// Optimized for GB10 with BM/BN tuning
 
 #include "mlx/backend/cuda/device.h"
 #include "mlx/backend/cuda/kernel_utils.cuh"
@@ -13,7 +14,6 @@ namespace mlx::core {
 namespace cu {
 
 // GPTQ-style quantization: groups along K dimension, not N
-// Formula: dequant_val = q * scale + bias (where bias = -zero from GPTQ)
 template <int NUM_WARPS, int group_size, int bits, typename T, typename Tile>
 __device__ inline void load_quantized(
     Tile& tile,
@@ -21,7 +21,7 @@ __device__ inline void load_quantized(
     const T* scales,
     const T* biases,
     int N,
-    int valid_rows) {  // Number of valid output channels
+    int valid_rows) {
   constexpr int NUM_THREADS = NUM_WARPS * 32;
   constexpr int ELEMENTS_PER_LOAD = sizeof(uint32_t) * get_pack_factor<bits>();
   constexpr int NUM_LOADS = Tile::NUMEL / ELEMENTS_PER_LOAD;
@@ -38,7 +38,6 @@ __device__ inline void load_quantized(
 
   x += row * Nx + col * (ELEMENTS_PER_LOAD / get_pack_factor<bits>());
 
-  // Only add offset if within valid range, otherwise point to first row (will be ignored)
   const T* scales_ptr = (row < valid_rows) ?
       (scales + row * Ng + col * ELEMENTS_PER_LOAD / group_size) : scales;
   const T* biases_ptr = (row < valid_rows) ?
@@ -50,7 +49,6 @@ __device__ inline void load_quantized(
     T vs[ELEMENTS_PER_LOAD];
 
     if (current_row < valid_rows) {
-      // Process valid rows normally
       uint32_t w = *reinterpret_cast<const uint32_t*>(x + i * STEP_ROWS * Nx);
       T s = scales_ptr[i * STEP_ROWS * Ng];
       T b = biases_ptr[i * STEP_ROWS * Ng];
@@ -61,7 +59,6 @@ __device__ inline void load_quantized(
         vs[j] = q_val * s + b;
       }
     } else {
-      // Fill invalid rows with zeros
       MLX_UNROLL
       for (int j = 0; j < ELEMENTS_PER_LOAD; j++) {
         vs[j] = static_cast<T>(0);
@@ -112,7 +109,7 @@ __global__ void qmm_t(
   RegisterTile<T, BN / WARPS_N, 16> B;
 
   const int max_rows = M - blockIdx.y * BM;
-  const int valid_weight_rows = min(BN, N - blockIdx.x * BN);  // Valid output channels in this block
+  const int valid_weight_rows = min(BN, N - blockIdx.x * BN);
 
   x += blockIdx.y * BM * K;
   w += blockIdx.x * BN * K / get_pack_factor<bits>();
@@ -131,6 +128,9 @@ __global__ void qmm_t(
     for (int k_block = 0; k_block < K; k_block += BK) {
       load_async<NUM_WARPS>(xs[tic], base_addr_xs[tic], x + k_block, K);
       cp_async_commit();
+      cp_async_wait_all();
+      __syncthreads();
+
       load_quantized<NUM_WARPS, group_size, bits>(
           ws[tic],
           w + k_block / get_pack_factor<bits>(),
@@ -138,7 +138,6 @@ __global__ void qmm_t(
           biases + k_block / group_size,
           K,
           valid_weight_rows);
-      cp_async_wait_all();
       __syncthreads();
 
       MLX_UNROLL
@@ -157,7 +156,6 @@ __global__ void qmm_t(
       }
     }
 
-    // Store output
     if (offset_n < N) {
       C.store_global(y, N, offset_m, offset_n);
     }
@@ -166,6 +164,9 @@ __global__ void qmm_t(
       load_async_safe<NUM_WARPS>(
           xs[tic], base_addr_xs[tic], x + k_block, K, max_rows);
       cp_async_commit();
+      cp_async_wait_all();
+      __syncthreads();
+
       load_quantized<NUM_WARPS, group_size, bits>(
           ws[tic],
           w + k_block / get_pack_factor<bits>(),
@@ -173,7 +174,6 @@ __global__ void qmm_t(
           biases + k_block / group_size,
           K,
           valid_weight_rows);
-      cp_async_wait_all();
       __syncthreads();
 
       MLX_UNROLL
@@ -192,7 +192,6 @@ __global__ void qmm_t(
       }
     }
 
-    // Store output with boundary checking
     if (offset_n < N) {
       C.store_global_safe(y, N, offset_m, offset_n, max_rows);
     }
@@ -224,7 +223,6 @@ void qmm(
         "[qmm] Only transposed matmul is supported for now");
   }
 
-  // Register input and output arrays with the command encoder
   enc.set_input_array(x);
   enc.set_input_array(w);
   enc.set_input_array(scales);
@@ -236,35 +234,76 @@ void qmm(
       dispatch_bits(bits_, [&](auto bits) {
         using DataType = cuda_type_t<MLX_GET_TYPE(type_tag)>;
 
-        constexpr int BM = 128;
-        constexpr int BN = 128;
         constexpr int BK = 32;
 
-        auto kernel = cu::qmm_t<
-            DataType, BM, BN, BK,
-            group_size.value, bits.value, true>;
+        // GB10-optimized tile size selection
+        // BM must be >= 64 to ensure NUM_LOADS_PER_THREAD >= 1
+        if (M <= 64) {
+          // Small-medium batch: Use BM=64, BN=64 for better parallelism
+          constexpr int BM = 64;
+          constexpr int BN = 64;
 
-        if (M % BM != 0) {
-          kernel = cu::qmm_t<
+          auto kernel = cu::qmm_t<
               DataType, BM, BN, BK,
-              group_size.value, bits.value, false>;
+              group_size.value, bits.value, true>;
+          if (M % BM != 0) {
+            kernel = cu::qmm_t<
+                DataType, BM, BN, BK,
+                group_size.value, bits.value, false>;
+          }
+
+          dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+          enc.add_kernel_node(
+              kernel, grid, dim3(2 * 4 * 32, 1, 1),
+              1 * sizeof(DataType) * (BM * BK + BN * BK),
+              x.data<DataType>(), w.data<uint8_t>(),
+              scales.data<DataType>(), biases.data<DataType>(),
+              out.data<DataType>(), M, N, K);
+
+        } else if (M <= 128) {
+          // Medium batch: Use BM=64, BN=128
+          constexpr int BM = 64;
+          constexpr int BN = 128;
+
+          auto kernel = cu::qmm_t<
+              DataType, BM, BN, BK,
+              group_size.value, bits.value, true>;
+          if (M % BM != 0) {
+            kernel = cu::qmm_t<
+                DataType, BM, BN, BK,
+                group_size.value, bits.value, false>;
+          }
+
+          dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+          enc.add_kernel_node(
+              kernel, grid, dim3(2 * 4 * 32, 1, 1),
+              1 * sizeof(DataType) * (BM * BK + BN * BK),
+              x.data<DataType>(), w.data<uint8_t>(),
+              scales.data<DataType>(), biases.data<DataType>(),
+              out.data<DataType>(), M, N, K);
+
+        } else {
+          // Large batch: Original config BM=128, BN=128
+          constexpr int BM = 128;
+          constexpr int BN = 128;
+
+          auto kernel = cu::qmm_t<
+              DataType, BM, BN, BK,
+              group_size.value, bits.value, true>;
+          if (M % BM != 0) {
+            kernel = cu::qmm_t<
+                DataType, BM, BN, BK,
+                group_size.value, bits.value, false>;
+          }
+
+          dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+          enc.add_kernel_node(
+              kernel, grid, dim3(2 * 4 * 32, 1, 1),
+              1 * sizeof(DataType) * (BM * BK + BN * BK),
+              x.data<DataType>(), w.data<uint8_t>(),
+              scales.data<DataType>(), biases.data<DataType>(),
+              out.data<DataType>(), M, N, K);
         }
-
-        dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
-
-        enc.add_kernel_node(
-            kernel,
-            grid,
-            dim3(2 * 4 * 32, 1, 1),
-            1 * sizeof(DataType) * (BM * BK + BN * BK),
-            x.data<DataType>(),
-            w.data<uint8_t>(),
-            scales.data<DataType>(),
-            biases.data<DataType>(),
-            out.data<DataType>(),
-            M,
-            N,
-            K);
       });
     });
   });
