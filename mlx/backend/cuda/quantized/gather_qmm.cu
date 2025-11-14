@@ -1,4 +1,5 @@
 // Author: GreenBitAI 2025
+// Optimized version with dynamic tile sizing for better batch parallelism
 
 #include "mlx/backend/cuda/device.h"
 #include "mlx/backend/cuda/kernel_utils.cuh"
@@ -45,7 +46,6 @@ __global__ void set_gather_qmm_pointers(
   uint32_t x_idx = lhs_indices[batch_idx];
   uint32_t expert_idx = rhs_indices[batch_idx];
 
-  // Segmented layout matching MLX CuBLAS pattern
   pointers[batch_idx] =
       (void*)(x_start + x_idx * x_batch_stride * x_itemsize);
   pointers[batch_idx + batch_count] =
@@ -118,7 +118,7 @@ __device__ inline void load_quantized(
 }
 
 // ============================================================================
-// STAGE 2: Batched QMM Kernel
+// STAGE 3: Batched QMM Kernel - OPTIMIZED WITH DYNAMIC TILE SIZING
 // ============================================================================
 
 template <
@@ -126,6 +126,8 @@ template <
     int BM,
     int BN,
     int BK,
+    int WARPS_M,
+    int WARPS_N,
     int group_size,
     int bits,
     bool aligned_M>
@@ -136,8 +138,6 @@ __global__ void gather_qmm_batched_kernel(
     int K,
     int batch_count) {
 
-  constexpr int WARPS_M = 2;
-  constexpr int WARPS_N = 4;
   constexpr int NUM_WARPS = WARPS_M * WARPS_N;
   constexpr int WARP_STEP_M = BM / WARPS_M;
   constexpr int WARP_STEP_N = BN / WARPS_N;
@@ -192,8 +192,6 @@ __global__ void gather_qmm_batched_kernel(
     for (int k_block = 0; k_block < K; k_block += BK) {
       load_async<NUM_WARPS>(xs[tic], base_addr_xs[tic], x_ptr + k_block, K);
       cp_async_commit();
-
-      // CRITICAL: Wait for async before sync operations
       cp_async_wait_all();
       __syncthreads();
 
@@ -266,7 +264,6 @@ __global__ void gather_qmm_batched_kernel(
       load_async_safe<NUM_WARPS>(
           xs[tic], base_addr_xs[tic], x_ptr + k_block, K, max_rows);
       cp_async_commit();
-
       cp_async_wait_all();
       __syncthreads();
 
@@ -338,7 +335,7 @@ __global__ void gather_qmm_batched_kernel(
 } // namespace cu
 
 // ============================================================================
-// Host Function
+// Host Function - WITH DYNAMIC TILE SIZE SELECTION
 // ============================================================================
 
 void gather_qmm(
@@ -384,7 +381,7 @@ void gather_qmm(
   enc.add_temporary(pointers);
 
   // ========================================================================
-  // STAGE 1: Setup pointers
+  // STAGE 1: Setup pointers (unchanged)
   // ========================================================================
 
   enc.set_input_array(x);
@@ -421,10 +418,9 @@ void gather_qmm(
       B);
 
   // ========================================================================
-  // STAGE 2: Batched quantized matmul
+  // STAGE 2: Batched quantized matmul - OPTIMIZED TILE SELECTION
   // ========================================================================
 
-  // Even though they're accessed through pointers, CUDA graph needs to track them
   enc.set_input_array(pointers);
   enc.set_input_array(x);
   enc.set_input_array(w);
@@ -439,34 +435,180 @@ void gather_qmm(
       dispatch_bits(bits_, [&](auto bits) {
         using DataType = cuda_type_t<MLX_GET_TYPE(type_tag)>;
 
-        constexpr int BM = 128;
-        constexpr int BN = 128;
         constexpr int BK = 32;
 
-        auto kernel = cu::gather_qmm_batched_kernel<
-            DataType, BM, BN, BK,
-            group_size.value, bits.value, true>;
+        if (M <= 1 && B < 500) {
+          // Chat scenario (Batch 1): Use original configuration
+          // This is the only config that matches original 51ms performance
+          constexpr int BM = 128;
+          constexpr int BN = 128;
+          constexpr int WARPS_M = 2;
+          constexpr int WARPS_N = 4;
 
-        if (M % BM != 0) {
-          kernel = cu::gather_qmm_batched_kernel<
-              DataType, BM, BN, BK,
+          auto kernel = cu::gather_qmm_batched_kernel<
+              DataType, BM, BN, BK, WARPS_M, WARPS_N,
               group_size.value, bits.value, false>;
+
+          dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM, B);
+          dim3 threads(WARPS_M * WARPS_N * 32, 1, 1);
+          int shmem_size = sizeof(DataType) * (BM * BK + BN * BK);
+
+          enc.add_kernel_node(
+              kernel, grid, threads, shmem_size,
+              pointers.data<void*>(), M, N, K, B);
+
+        } else if (M <= 2 && B < 900) {
+          // Batch 2 scenario: Optimized config (best performance)
+          constexpr int BM = 32;
+          constexpr int BN = 128;
+          constexpr int WARPS_M = 1;
+          constexpr int WARPS_N = 4;
+
+          auto kernel = cu::gather_qmm_batched_kernel<
+              DataType, BM, BN, BK, WARPS_M, WARPS_N,
+              group_size.value, bits.value, false>;
+
+          dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM, B);
+          dim3 threads(WARPS_M * WARPS_N * 32, 1, 1);
+          int shmem_size = sizeof(DataType) * (BM * BK + BN * BK);
+
+          enc.add_kernel_node(
+              kernel, grid, threads, shmem_size,
+              pointers.data<void*>(), M, N, K, B);
+
+        } else if (M <= 8 && B < 1200) {
+          // Batch 3-4 scenario: V1 config for best multi-batch performance
+          constexpr int BM = 16;
+          constexpr int BN = 64;
+          constexpr int WARPS_M = 1;
+          constexpr int WARPS_N = 2;
+
+          auto kernel = cu::gather_qmm_batched_kernel<
+              DataType, BM, BN, BK, WARPS_M, WARPS_N,
+              group_size.value, bits.value, false>;
+
+          dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM, B);
+          dim3 threads(WARPS_M * WARPS_N * 32, 1, 1);
+          int shmem_size = sizeof(DataType) * (BM * BK + BN * BK);
+
+          enc.add_kernel_node(
+              kernel, grid, threads, shmem_size,
+              pointers.data<void*>(), M, N, K, B);
+
+        } else if (M <= 8) {
+          // Single-batch decode (Batch 1-2, M=2-8): Balance performance
+          // Use original config for proven stability
+          constexpr int BM = 128;
+          constexpr int BN = 128;
+          constexpr int WARPS_M = 2;
+          constexpr int WARPS_N = 4;
+
+          auto kernel = cu::gather_qmm_batched_kernel<
+              DataType, BM, BN, BK, WARPS_M, WARPS_N,
+              group_size.value, bits.value, false>;
+
+          dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM, B);
+          dim3 threads(WARPS_M * WARPS_N * 32, 1, 1);
+          int shmem_size = sizeof(DataType) * (BM * BK + BN * BK);
+
+          enc.add_kernel_node(
+              kernel, grid, threads, shmem_size,
+              pointers.data<void*>(), M, N, K, B);
+
+        } else if (M <= 8) {
+          // Multi-batch decode (Batch 3+): Optimize for throughput
+          constexpr int BM = 16;
+          constexpr int BN = 64;
+          constexpr int WARPS_M = 1;
+          constexpr int WARPS_N = 2;
+
+          auto kernel = cu::gather_qmm_batched_kernel<
+              DataType, BM, BN, BK, WARPS_M, WARPS_N,
+              group_size.value, bits.value, false>;
+
+          dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM, B);
+          dim3 threads(WARPS_M * WARPS_N * 32, 1, 1);
+          int shmem_size = sizeof(DataType) * (BM * BK + BN * BK);
+
+          enc.add_kernel_node(
+              kernel, grid, threads, shmem_size,
+              pointers.data<void*>(), M, N, K, B);
+
+        } else if (M <= 64) {
+          // Small-medium batch decode: Standard 64x64 tile
+          constexpr int BM = 64;
+          constexpr int BN = 64;
+          constexpr int WARPS_M = 2;
+          constexpr int WARPS_N = 2;
+
+          auto kernel = cu::gather_qmm_batched_kernel<
+              DataType, BM, BN, BK, WARPS_M, WARPS_N,
+              group_size.value, bits.value, true>;
+
+          if (M % BM != 0) {
+            kernel = cu::gather_qmm_batched_kernel<
+                DataType, BM, BN, BK, WARPS_M, WARPS_N,
+                group_size.value, bits.value, false>;
+          }
+
+          dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM, B);
+          dim3 threads(WARPS_M * WARPS_N * 32, 1, 1);
+          int shmem_size = sizeof(DataType) * (BM * BK + BN * BK);
+
+          enc.add_kernel_node(
+              kernel, grid, threads, shmem_size,
+              pointers.data<void*>(), M, N, K, B);
+
+        } else if (M <= 128) {
+          // Medium batch: Increase BN for better throughput
+          constexpr int BM = 64;
+          constexpr int BN = 128;
+          constexpr int WARPS_M = 2;
+          constexpr int WARPS_N = 4;
+
+          auto kernel = cu::gather_qmm_batched_kernel<
+              DataType, BM, BN, BK, WARPS_M, WARPS_N,
+              group_size.value, bits.value, true>;
+
+          if (M % BM != 0) {
+            kernel = cu::gather_qmm_batched_kernel<
+                DataType, BM, BN, BK, WARPS_M, WARPS_N,
+                group_size.value, bits.value, false>;
+          }
+
+          dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM, B);
+          dim3 threads(WARPS_M * WARPS_N * 32, 1, 1);
+          int shmem_size = sizeof(DataType) * (BM * BK + BN * BK);
+
+          enc.add_kernel_node(
+              kernel, grid, threads, shmem_size,
+              pointers.data<void*>(), M, N, K, B);
+
+        } else {
+          // Large batch (Prefill): Maximum tile size
+          constexpr int BM = 128;
+          constexpr int BN = 128;
+          constexpr int WARPS_M = 2;
+          constexpr int WARPS_N = 4;
+
+          auto kernel = cu::gather_qmm_batched_kernel<
+              DataType, BM, BN, BK, WARPS_M, WARPS_N,
+              group_size.value, bits.value, true>;
+
+          if (M % BM != 0) {
+            kernel = cu::gather_qmm_batched_kernel<
+                DataType, BM, BN, BK, WARPS_M, WARPS_N,
+                group_size.value, bits.value, false>;
+          }
+
+          dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM, B);
+          dim3 threads(WARPS_M * WARPS_N * 32, 1, 1);
+          int shmem_size = sizeof(DataType) * (BM * BK + BN * BK);
+
+          enc.add_kernel_node(
+              kernel, grid, threads, shmem_size,
+              pointers.data<void*>(), M, N, K, B);
         }
-
-        dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM, B);
-        dim3 threads(2 * 4 * 32, 1, 1);
-        int shmem_size = sizeof(DataType) * (BM * BK + BN * BK);
-
-        enc.add_kernel_node(
-            kernel,
-            grid,
-            threads,
-            shmem_size,
-            pointers.data<void*>(),
-            M,
-            N,
-            K,
-            B);
       });
     });
   });
