@@ -4102,6 +4102,20 @@ array quantized_matmul(
     std::optional<int> bits_ /* = std::nullopt */,
     const std::string& mode /* = "affine" */,
     StreamOrDevice s /* = {} */) {
+  // special dtype conversion ============================================
+  // Force fp32 to bfloat16
+  // Cause CUDA kernel (qmm.cu) only support fp16 and bfloat16
+  if (x.dtype() == float32) {
+    x = astype(x, bfloat16, s);
+  }
+  if (scales.dtype() == float32) {
+    scales = astype(scales, bfloat16, s);
+  }
+  if (biases.has_value() && biases->dtype() == float32) {
+    biases = astype(*biases, bfloat16, s);
+  }
+  // end of special dtype convertion ============================================
+
   auto [dtype, qmode] = validate_mode_with_type(
       "quantized_matmul", scales, biases, std::nullopt, mode);
 

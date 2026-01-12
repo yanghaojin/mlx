@@ -88,6 +88,76 @@ __device__ __forceinline__ void mma_t(
 }
 
 /**
+ * Multiply the 16x16 float16 tiles and accumulate the result in one 16x16
+ * float tile.
+ *
+ * We actually perform C += A @ B.T
+ */
+__device__ __forceinline__ void mma_t(
+    Tile16x16<float>& C,
+    Tile16x16<__half>& A,
+    Tile16x16<__half>& B) {
+#if defined(MLX_CUDA_SM_80_ENABLED)
+  asm volatile(
+      "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+      "{%0, %1, %2, %3}, "
+      "{%4, %5, %6, %7}, "
+      "{%8, %9}, "
+      "{%10, %11, %12, %13};"
+
+      // D matrix
+      : "+f"(C.values[0].x),
+        "+f"(C.values[0].y),
+        "+f"(C.values[1].x),
+        "+f"(C.values[1].y)
+
+      // A matrix
+      : "r"(*(uint32_t*)(&A.values[0])),
+        "r"(*(uint32_t*)(&A.values[1])),
+        "r"(*(uint32_t*)(&A.values[2])),
+        "r"(*(uint32_t*)(&A.values[3])),
+
+        // B matrix
+        "r"(*(uint32_t*)(&B.values[0])),
+        "r"(*(uint32_t*)(&B.values[2])),
+
+        // C matrix
+        "f"(C.values[0].x),
+        "f"(C.values[0].y),
+        "f"(C.values[1].x),
+        "f"(C.values[1].y));
+  asm volatile(
+      "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+      "{%0, %1, %2, %3}, "
+      "{%4, %5, %6, %7}, "
+      "{%8, %9}, "
+      "{%10, %11, %12, %13};"
+
+      // D matrix
+      : "+f"(C.values[2].x),
+        "+f"(C.values[2].y),
+        "+f"(C.values[3].x),
+        "+f"(C.values[3].y)
+
+      // A matrix
+      : "r"(*(uint32_t*)(&A.values[0])),
+        "r"(*(uint32_t*)(&A.values[1])),
+        "r"(*(uint32_t*)(&A.values[2])),
+        "r"(*(uint32_t*)(&A.values[3])),
+
+        // B matrix
+        "r"(*(uint32_t*)(&B.values[1])),
+        "r"(*(uint32_t*)(&B.values[3])),
+
+        // C matrix
+        "f"(C.values[2].x),
+        "f"(C.values[2].y),
+        "f"(C.values[3].x),
+        "f"(C.values[3].y));
+#endif
+}
+
+/**
  * Multiply larger register tiles by delegating to mma_t.
  */
 template <typename U, typename T, int M, int N, int K>
