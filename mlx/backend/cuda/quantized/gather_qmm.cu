@@ -103,8 +103,13 @@ __device__ inline void load_quantized(
 
       MLX_UNROLL
       for (int j = 0; j < ELEMENTS_PER_LOAD; j++) {
-        T q_val = static_cast<T>((w >> (j * bits)) & MASK);
-        vs[j] = q_val * s + b;
+        // T q_val = static_cast<T>((w >> (j * bits)) & MASK);
+        // vs[j] = q_val * s + b;
+        float q_val = static_cast<float>((w >> (j * bits)) & MASK);
+        float sf = static_cast<float>(s);
+        float bf = static_cast<float>(b);
+        vs[j] = static_cast<T>(q_val * sf + bf);
+
       }
     } else {
       MLX_UNROLL
@@ -218,6 +223,7 @@ __global__ void gather_qmm_batched_kernel(
             k * 16 + laneid / 16 * 8);
         mma_t(C, A, B);
       }
+      __syncthreads(); // add this
     }
 
     // Output with N-dimension boundary checking
@@ -290,6 +296,7 @@ __global__ void gather_qmm_batched_kernel(
             k * 16 + laneid / 16 * 8);
         mma_t(C, A, B);
       }
+      __syncthreads(); // add this
     }
 
     // Output with both M and N bounds checking

@@ -55,8 +55,10 @@ __device__ inline void load_quantized(
 
       MLX_UNROLL
       for (int j = 0; j < ELEMENTS_PER_LOAD; j++) {
-        T q_val = static_cast<T>((w >> (j * bits)) & MASK);
-        vs[j] = q_val * s + b;
+        float q_val = static_cast<float>((w >> (j * bits)) & MASK);
+        float sf = static_cast<float>(s);
+        float bf = static_cast<float>(b);
+        vs[j] = static_cast<T>(q_val * sf + bf);
       }
     } else {
       MLX_UNROLL
@@ -125,6 +127,7 @@ __global__ void qmm_t(
   base_addr_ws[0] = __cvta_generic_to_shared(&ws[0].data[0]);
 
   if (aligned_M || max_rows >= BM) {
+    // Fast path: M is aligned
     for (int k_block = 0; k_block < K; k_block += BK) {
       load_async<NUM_WARPS>(xs[tic], base_addr_xs[tic], x + k_block, K);
       cp_async_commit();
@@ -154,12 +157,48 @@ __global__ void qmm_t(
             k * 16 + laneid / 16 * 8);
         mma_t(C, A, B);
       }
+      __syncthreads();
     }
 
-    if (offset_n < N) {
+    // Output: N-dimension boundary checking
+    if (offset_n + WARP_STEP_N <= N) {
       C.store_global(y, N, offset_m, offset_n);
+    } else if (offset_n < N) {
+      // Partial N: element-wise store with M and N bounds
+      const int local_row_base = offset_m + (laneid / 4);
+      const int local_col_base = offset_n + (laneid % 4) * 2;
+
+      for (int tile_y = 0; tile_y < C.TILES_Y; tile_y++) {
+        for (int tile_x = 0; tile_x < C.TILES_X; tile_x++) {
+          auto& tile = C.data[tile_y * C.TILES_X + tile_x];
+          int gr = local_row_base + tile_y * 16;
+          int gc = local_col_base + tile_x * 16;
+
+          if (gr < M && gc < N)
+            y[gr * N + gc] = static_cast<T>(tile.values[0].x);
+          if (gr < M && gc + 1 < N)
+            y[gr * N + gc + 1] = static_cast<T>(tile.values[0].y);
+
+          if (gr + 8 < M && gc < N)
+            y[(gr + 8) * N + gc] = static_cast<T>(tile.values[1].x);
+          if (gr + 8 < M && gc + 1 < N)
+            y[(gr + 8) * N + gc + 1] = static_cast<T>(tile.values[1].y);
+
+          if (gr < M && gc + 8 < N)
+            y[gr * N + gc + 8] = static_cast<T>(tile.values[2].x);
+          if (gr < M && gc + 9 < N)
+            y[gr * N + gc + 9] = static_cast<T>(tile.values[2].y);
+
+          if (gr + 8 < M && gc + 8 < N)
+            y[(gr + 8) * N + gc + 8] = static_cast<T>(tile.values[3].x);
+          if (gr + 8 < M && gc + 9 < N)
+            y[(gr + 8) * N + gc + 9] = static_cast<T>(tile.values[3].y);
+        }
+      }
     }
+
   } else {
+    // Slow path: M boundary checking needed
     for (int k_block = 0; k_block < K; k_block += BK) {
       load_async_safe<NUM_WARPS>(
           xs[tic], base_addr_xs[tic], x + k_block, K, max_rows);
@@ -190,10 +229,44 @@ __global__ void qmm_t(
             k * 16 + laneid / 16 * 8);
         mma_t(C, A, B);
       }
+      __syncthreads();
     }
 
-    if (offset_n < N) {
+    // Output: both M and N bounds checking
+    if (offset_n + WARP_STEP_N <= N) {
       C.store_global_safe(y, N, offset_m, offset_n, max_rows);
+    } else if (offset_n < N) {
+      // Partial N + partial M: element-wise store
+      const int local_row_base = offset_m + (laneid / 4);
+      const int local_col_base = offset_n + (laneid % 4) * 2;
+
+      for (int tile_y = 0; tile_y < C.TILES_Y; tile_y++) {
+        for (int tile_x = 0; tile_x < C.TILES_X; tile_x++) {
+          auto& tile = C.data[tile_y * C.TILES_X + tile_x];
+          int gr = local_row_base + tile_y * 16;
+          int gc = local_col_base + tile_x * 16;
+
+          if (gr < max_rows && gc < N)
+            y[gr * N + gc] = static_cast<T>(tile.values[0].x);
+          if (gr < max_rows && gc + 1 < N)
+            y[gr * N + gc + 1] = static_cast<T>(tile.values[0].y);
+
+          if (gr + 8 < max_rows && gc < N)
+            y[(gr + 8) * N + gc] = static_cast<T>(tile.values[1].x);
+          if (gr + 8 < max_rows && gc + 1 < N)
+            y[(gr + 8) * N + gc + 1] = static_cast<T>(tile.values[1].y);
+
+          if (gr < max_rows && gc + 8 < N)
+            y[gr * N + gc + 8] = static_cast<T>(tile.values[2].x);
+          if (gr < max_rows && gc + 9 < N)
+            y[gr * N + gc + 9] = static_cast<T>(tile.values[2].y);
+
+          if (gr + 8 < max_rows && gc + 8 < N)
+            y[(gr + 8) * N + gc + 8] = static_cast<T>(tile.values[3].x);
+          if (gr + 8 < max_rows && gc + 9 < N)
+            y[(gr + 8) * N + gc + 9] = static_cast<T>(tile.values[3].y);
+        }
+      }
     }
   }
 }
